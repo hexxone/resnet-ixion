@@ -165,10 +165,10 @@ class OrientationDetectionONNX:
     def get_angles_avg(self, image: Image.Image) -> tuple:
         """
         Process an image with all four rotations and average the predictions,
-        accounting for the rotations.
+        accounting for the rotations using improved consistency checking.
 
         Returns:
-            tuple: (angles_dict, inconsistencies)
+            tuple: (angles_dict, inconsistencies, confidence_score)
         """
         # Convert image to numpy (matches the ONNX input format)
         numpy_image = self.to_numpy(image)
@@ -176,42 +176,25 @@ class OrientationDetectionONNX:
         # Create a dictionary to accumulate scores for each absolute orientation
         accumulated = {a: [] for a in self.angles}
 
+        # Track predictions for each rotation for analysis
+        rotation_predictions = []
+
         # Track inconsistencies
         inconsistencies = []
 
-        # Base prediction (for the first orientation)
-        base_pred = None
-
         # For each rotation (0°, 90°, 180°, 270°)
-        for rotation in self.angles:
+        for rotation_idx, rotation in enumerate(self.angles):
             # Get predictions for the current orientation
             angles = self.get_angles(numpy_image.copy())
 
-            # Get the best angle prediction
-            best_angle = max(angles, key=angles.get)
-
-            # For the first rotation, save the baseline prediction
-            if base_pred is None:
-                base_pred = best_angle
-            else:
-                # Check that the model is consistent as we rotate
-                expected_angle = (base_pred + rotation) % 360
-                if best_angle != expected_angle:
-                    # Only show consistency warnings in verbose mode or for significant discrepancies
-                    best_score = angles[best_angle]
-                    expected_score = angles.get(expected_angle, 0)
-                    score_diff = abs(best_score - expected_score)
-
-                    # Only warn if warnings aren't suppressed and there's a significant difference
-                    if not self.suppress_warnings:
-                        # 30% difference threshold and > 10% confidence?
-                        if score_diff > 0.3 and best_score > 0.1 and expected_score > 0.1:
-                            inconsistency_msg = (
-                                    f"Rotation consistency check - Expected {expected_angle}° but got {best_angle}° " +
-                                    f"(scores: {best_score:.2f} vs {expected_score:.2f})"
-                            )
-                            inconsistencies.append(inconsistency_msg)
-                            print(f"Note: {inconsistency_msg}")
+            # Store prediction details for this rotation
+            prediction_details = {
+                'rotation': rotation,
+                'predicted_angles': angles,
+                'best_angle': max(angles, key=angles.get),
+                'best_score': angles[max(angles, key=angles.get)]
+            }
+            rotation_predictions.append(prediction_details)
 
             # Adjust angles to absolute orientation (relative to original image)
             for pred_angle, score in angles.items():
@@ -219,27 +202,135 @@ class OrientationDetectionONNX:
                 absolute_angle = (pred_angle - rotation) % 360
                 accumulated[absolute_angle].append(score)
 
-            # Rotate the numpy array for the next iteration using np.rot90
-            # This matches how the ONNX implementation rotates
-            # Use .copy() to create a contiguous array (fixes negative stride issues)
+            # Rotate the numpy array for the next iteration
             numpy_image = np.rot90(numpy_image, k=1, axes=(2, 3)).copy()
 
-        # Average the scores for each absolute orientation
+        # Run improved consistency analysis on the collected predictions
+        inconsistencies, reliability_score = self._analyze_rotation_consistency(rotation_predictions)
+
+        # Average the scores for each absolute orientation, with potential weighting
         result = {}
         for angle in sorted(accumulated.keys()):
+            # Basic approach: simple average
             overall_avg = sum(accumulated[angle]) / len(accumulated[angle])
             result[angle] = overall_avg
 
-        return result, inconsistencies
+        return result, inconsistencies, reliability_score
+
+    def _analyze_rotation_consistency(self, predictions):
+        """
+        Analyze the consistency of predictions across different rotations with
+        more balanced detection criteria.
+
+        Args:
+            predictions: List of dictionaries with prediction details for each rotation
+
+        Returns:
+            tuple: (inconsistencies, reliability_score)
+        """
+        inconsistencies = []
+
+        # Extract base prediction (from original orientation)
+        base_pred = predictions[0]
+        base_angle = base_pred['best_angle']
+        base_confidence = base_pred['best_score']
+
+        # Calculate first/second confidence ratio for each rotation
+        for pred in predictions:
+            sorted_scores = sorted(pred['predicted_angles'].values(), reverse=True)
+            if len(sorted_scores) >= 2:
+                pred['confidence_ratio'] = sorted_scores[0] / max(sorted_scores[1], 0.001)  # Avoid div by zero
+            else:
+                pred['confidence_ratio'] = float('inf')  # Very high ratio if only one score
+
+        # Calculate maximum confidence for any prediction
+        max_confidence = max(pred['best_score'] for pred in predictions)
+
+        # Check consistency for each rotated prediction
+        num_inconsistencies = 0
+        rotation_issues = {}  # Track issues by rotation for filtering
+
+        for i, pred in enumerate(predictions[1:], 1):  # Skip the base prediction
+            rotation = pred['rotation']
+            actual_angle = pred['best_angle']
+            expected_angle = (base_angle + rotation) % 360
+
+            # Calculate key metrics
+            confidence = pred['best_score']
+            expected_confidence = pred['predicted_angles'].get(expected_angle, 0)
+            confidence_diff = abs(confidence - expected_confidence)
+
+            # MODIFIED: More conservative adaptive threshold
+            base_threshold = 0.4  # Increased from 0.3 to 0.4
+            confidence_factor = 0.5 + 0.5 * (base_confidence + confidence) / 2  # Scale from 0.5 to 1.0
+            adaptive_threshold = base_threshold * (2 - confidence_factor)  # Lower threshold for higher confidence
+
+            # Check if this is an inconsistency using more balanced criteria
+            is_inconsistent = False
+            reason = ""
+
+            # MODIFIED: More selective criteria
+            # Criterion 1: Very significant confidence difference with high confidence predictions
+            if confidence_diff > adaptive_threshold and confidence > 0.5 and expected_confidence > 0.2:
+                is_inconsistent = True
+                reason = f"large confidence difference ({confidence_diff:.2f} > {adaptive_threshold:.2f})"
+
+            # Criterion 2: Completely wrong angle prediction with very high confidence
+            elif actual_angle != expected_angle and confidence > 0.7 and base_confidence > 0.7:
+                # Only consider very large angle differences
+                angle_diff = min((actual_angle - expected_angle) % 360, (expected_angle - actual_angle) % 360)
+                if angle_diff >= 180:  # Only the most extreme cases
+                    is_inconsistent = True
+                    reason = f"opposite angle prediction with high confidence"
+
+            # REMOVED: Low confidence ratio criterion (too sensitive)
+
+            if is_inconsistent and not self.suppress_warnings:
+                rotation_issues[rotation] = {
+                    'message': f"Rotation consistency check - Expected {expected_angle}° but got {actual_angle}° "
+                               f"(scores: {confidence:.2f} vs {expected_confidence:.2f}), {reason}",
+                    'severity': confidence_diff,  # Use difference as severity
+                    'rotation': rotation
+                }
+                num_inconsistencies += 1
+
+        # ADDED: Filter to include only the most significant inconsistencies
+        # This prevents counting minor issues while keeping the important ones
+        if rotation_issues:
+            # Sort by severity and take only the top 2 most significant issues
+            significant_issues = sorted(rotation_issues.values(), key=lambda x: x['severity'], reverse=True)[:2]
+            for issue in significant_issues:
+                inconsistencies.append(issue['message'])
+
+        # Calculate an improved reliability score (0.0 to 1.0)
+        # Less sensitive to minor inconsistencies
+        if len(predictions) <= 1:
+            reliability_score = base_confidence  # Just use base confidence if only one prediction
+        else:
+            # Start with average of top confidences
+            avg_confidence = sum(pred['best_score'] for pred in predictions) / len(predictions)
+
+            # Penalize for inconsistencies, but less severely
+            # MODIFIED: More forgiving consistency factor
+            consistency_factor = max(0, 1 - (num_inconsistencies / (len(predictions) * 2)))
+
+            # Consider confidence ratio (higher is better)
+            avg_ratio = sum(pred.get('confidence_ratio', 1) for pred in predictions) / len(predictions)
+            ratio_factor = min(1.0, avg_ratio / 3)  # Cap at 1.0, with 3.0 being "ideal"
+
+            # MODIFIED: Changed weights to emphasize confidence more
+            reliability_score = avg_confidence * (0.6 + 0.3 * consistency_factor + 0.1 * ratio_factor)
+
+        return inconsistencies, reliability_score
 
     def get_best_angle(self, image: Image.Image) -> tuple:
         """
-        Get the best angle and its confidence using the averaged method.
-        Returns (best_angle, confidence, all_probabilities, inconsistencies)
+        Get the best angle and its confidence using the improved averaged method.
+        Returns (best_angle, confidence, all_probabilities, inconsistencies, reliability)
         """
-        angles, inconsistencies = self.get_angles_avg(image)
+        angles, inconsistencies, reliability = self.get_angles_avg(image)
         best_angle = max(angles, key=angles.get)
-        return best_angle, angles[best_angle], angles, inconsistencies
+        return best_angle, angles[best_angle], angles, inconsistencies, reliability
 
 
 class ImageProcessor:
@@ -320,7 +411,7 @@ class ImageProcessor:
 
 def process_image_batch(batch, onnx_path, args, output_folder, process_id=0):
     """
-    Process a batch of images.
+    Process a batch of images with improved correction decisions.
 
     Args:
         batch: List of image paths to process
@@ -351,6 +442,7 @@ def process_image_batch(batch, onnx_path, args, output_folder, process_id=0):
             'corrected': False,
             'status': 'Processed',
             'inconsistencies': [],
+            'reliability': 0,
             'error': None
         }
 
@@ -364,27 +456,80 @@ def process_image_batch(batch, onnx_path, args, output_folder, process_id=0):
             except Exception:
                 exif_data = None
 
-            # Get the best angle, confidence, all probabilities, and inconsistencies
-            best_angle, confidence, all_probs, inconsistencies = od.get_best_angle(img)
+            # Get the best angle, confidence, all probabilities, inconsistencies, and reliability
+            best_angle, confidence, all_probs, inconsistencies, reliability = od.get_best_angle(img)
 
             # Update results
             result['best_angle'] = best_angle
             result['confidence'] = confidence
             result['all_probs'] = all_probs
             result['inconsistencies'] = inconsistencies
+            result['reliability'] = reliability
 
-            # Print the result if verbose or not part of a batch
+            # Calculate secondary metrics for decision-making
+            second_best_angle = None
+            second_best_conf = 0
+            for angle, conf in all_probs.items():
+                if angle != best_angle and conf > second_best_conf:
+                    second_best_angle = angle
+                    second_best_conf = conf
+
+            # Confidence margin is the ratio between best and second best
+            confidence_margin = confidence / max(second_best_conf, 0.001)  # Avoid div by zero
+
+            # Determine if we should trust this prediction for correction
+            should_correct = False
+            correction_reason = "insufficient confidence"
+
+            # Base threshold from args
+            base_threshold = args.threshold
+
+            # NEW: Simplified and more balanced decision logic
+            # 1. If no inconsistencies and good confidence, correct
+            if not inconsistencies and confidence > base_threshold * 0.9:
+                should_correct = True
+                correction_reason = "good confidence, no inconsistencies"
+
+            # 2. Very high confidence overrides minor inconsistencies
+            elif confidence > base_threshold + 0.05 and confidence_margin > 3.5:
+                should_correct = True
+                correction_reason = "very high confidence margin"
+
+            # 3. Good reliability is more important than inconsistencies
+            elif reliability > 0.75:
+                should_correct = True
+                correction_reason = f"strong reliability ({reliability:.2f})"
+
+            # 4. For non-zero angles with dominant confidence, correct regardless
+            elif best_angle != 0 and confidence > 0.75 and second_best_conf < 0.15:
+                should_correct = True
+                correction_reason = "clear dominant orientation"
+
+            # NEW: Add visualization about confidence distribution
             prefix = f"[Process {process_id}, Item {i}] "
             if args.verbose:
                 print(f"\n{prefix}{img_path}:")
-                for angle, prob in sorted(all_probs.items()):
-                    star = "*" if angle == best_angle else " "
-                    print(f"{star} {angle}°: {prob * 100:.2f}%")
-            else:
-                print(f"{prefix}{img_path}: Orientation {best_angle:03d}° (Confidence: {confidence * 100:.2f}%)")
+                print(f"Reliability: {reliability:.2f}, Confidence margin: {confidence_margin:.2f}")
 
-            # Correct the orientation if requested and confidence is high enough
-            if args.correct and confidence > args.threshold and best_angle != 0:
+                # Create a simple ASCII visualization of confidence distribution
+                print("Confidence distribution:")
+                max_bars = 40  # Maximum bar length
+                for angle, prob in sorted(all_probs.items()):
+                    bar_length = int(prob * max_bars)
+                    bar = "█" * bar_length
+                    star = "*" if angle == best_angle else " "
+                    print(f"{star} {angle:03d}°: {prob * 100:5.1f}% |{bar}")
+
+                if should_correct:
+                    print(f"Decision: CORRECT ({correction_reason})")
+                else:
+                    print(f"Decision: SKIP ({correction_reason})")
+            else:
+                print(
+                    f"{prefix}{img_path}: Orientation {best_angle:03d}° (Confidence: {confidence * 100:.1f}%, Reliability: {reliability * 100:.1f}%)")
+
+            # Correct the orientation if requested and our decision logic says we should
+            if args.correct and best_angle != 0 and should_correct:
                 # Correct the image
                 corrected_img = ImageProcessor.correct_orientation(img, best_angle, exif_data)
 
@@ -403,8 +548,10 @@ def process_image_batch(batch, onnx_path, args, output_folder, process_id=0):
                 ImageProcessor.preserve_file_metadata(str(img_path), str(out_path))
 
                 result['corrected'] = True
-                result['status'] = 'Corrected'
-                print(f"  - Corrected to 0° and saved to {out_path}")
+                result['status'] = f"Corrected ({correction_reason})"
+                print(f"  - Corrected to 0° and saved to {out_path} ({correction_reason})")
+            elif args.correct and best_angle != 0:
+                print(f"  - Not corrected: {correction_reason}")
 
         except Exception as e:
             result['status'] = 'Error'
@@ -433,9 +580,9 @@ def csv_writer_process(csv_path, result_queue, total_images):
         with open(csv_path, 'w', newline='', encoding='utf-8') as f:
             writer = csv.writer(f)
 
-            # Write header
+            # Write header with new reliability column
             writer.writerow([
-                'Image', 'Best Angle', 'Confidence',
+                'Image', 'Best Angle', 'Confidence', 'Reliability',
                 'Prob 0°', 'Prob 90°', 'Prob 180°', 'Prob 270°',
                 'Corrected', 'Status', 'Inconsistencies'
             ])
@@ -457,7 +604,8 @@ def csv_writer_process(csv_path, result_queue, total_images):
                         str(result['img_path']),
                         "ERROR",
                         str(result['error']),
-                        "", "", "", "",
+                        "",  # Reliability
+                        "", "", "", "",  # Probabilities
                         "No",
                         "Error",
                         ""
@@ -467,6 +615,7 @@ def csv_writer_process(csv_path, result_queue, total_images):
                         str(result['img_path']),
                         result['best_angle'],
                         f"{result['confidence'] * 100:.2f}%",
+                        f"{result.get('reliability', 0) * 100:.2f}%",  # New reliability column
                         f"{result['all_probs'][0] * 100:.2f}%",
                         f"{result['all_probs'][90] * 100:.2f}%",
                         f"{result['all_probs'][180] * 100:.2f}%",
@@ -523,8 +672,8 @@ def main():
                         help='Print detailed probabilities for each image')
     parser.add_argument('--log_interval', type=float, default=3.0,
                         help='Time interval in seconds between progress logs')
-    parser.add_argument('--no_onnx', action='store_true',
-                        help='Do not convert to ONNX, use PyTorch model directly (slower)')
+    parser.add_argument('--use_smart_correction', action='store_true', default=True,
+                        help='Use smart correction logic instead of simple threshold')
     parser.add_argument('--skip_processed', action='store_true',
                         help='Skip files that have already been processed (requires --csv)')
     args = parser.parse_args()
@@ -563,6 +712,7 @@ def main():
 
     print(f"Scanning folder: {input_folder}")
     print(f"Confidence threshold: {args.threshold * 100:.1f}%")
+    print(f"Using smart correction: {args.use_smart_correction}")
 
     # Find all image files
     image_files = []

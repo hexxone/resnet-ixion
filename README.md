@@ -36,6 +36,13 @@ it's been converted to a classfication model with 4 classes. `0°, 90°, 180°, 
 
 `python batch_orientation_detector.py input_folder [options]`
 
+One worker thread will roughly take 1GB of RAM.
+
+By default, we will use the Count of CPU Cores -1, so if you have a CPU with many cores, you will need lots of RAM 
+or reduce worker count.
+
+It is recommended to run the operation on files on an SSD for optimal performance.
+
 ### Example
 
 ```bash
