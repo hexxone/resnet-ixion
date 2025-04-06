@@ -179,3 +179,4 @@ cython_debug/
 
 # Open Neural Network Exchange
 *.onnx
+*.pth
