@@ -3,7 +3,6 @@ import argparse
 import csv
 import os
 import time
-import tempfile
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from threading import Lock
@@ -11,9 +10,8 @@ import multiprocessing
 
 import numpy as np
 import torch
-import torch.nn as nn
 from PIL import Image, ExifTags
-from torchvision import models, transforms
+from torchvision import transforms
 
 # ONNX Runtime imports - you'll need to install this package
 import onnxruntime as ort

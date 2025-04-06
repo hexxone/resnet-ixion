@@ -1,27 +1,12 @@
-##  Image Orientation Detection Using ResNet
+##  Image Orientation Detection Using ResNet - Batch Processing
 
-Try it in Google Colab [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1VQ0U_WUIAObFzZtm9WEQWap8i6C6NMHW?usp=sharing)
-
-Or download the model from [GitHub Releases](https://github.com/parsapoorsh/resnet-ixion/releases):
+Forked from this repo: https://github.com/parsapoorsh/resnet-ixion
 
 ## Intro
 
 this model is a fine-tuned variant of resnet152.
 
 it's been converted to a classfication model with 4 classes. `0°, 90°, 180°, 270°`.
-
-![image](https://raw.githubusercontent.com/parsapoorsh/resnet-ixion/refs/heads/master/README.jpg)
-
-### Training Data
-
-for fine-tunning this model, i used MS COCO (Microsoft Common Objects in Context) dataset.
-`train2017` and `test2017` for training, and `val2017` for validation.
-
-### Training Hardware
-
-GPU: `NVIDIA GTX 1660 SUPER 6 GIB VRAM`
-
-time per epoch: ~ 3h:45m
 
 ## Batch Folder Processing
 
@@ -59,7 +44,7 @@ git clone https://github.com/hexxone/resnet-ixion.git
 pip install -r .\requirement.txt
 
 # Download the model if needed
-wget https://github.com/parsapoorsh/resnet-ixion/releases/download/1.0.0/resnet152_ixion_e3-84529282.pth -O resnet152_ixion_e3-84529282.pth
+wget https://github.com/parsapoorsh/resnet-ixion/releases/download/1.0.0/resnet152_ixion_e3-84529282.onnx -O resnet152_ixion_e3-84529282.onnx
 
 # Process images with automatic correction
 python batch_orientation_detector.py ~/Pictures/vacation --correct --output_folder ~/Pictures/corrected
