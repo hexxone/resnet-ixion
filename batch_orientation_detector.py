@@ -4,10 +4,13 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
-from PIL import Image
+from PIL import Image, ExifTags
 from torchvision import models, transforms
 import csv
 import sys
+import os
+
+print("==== batch processing init ====")
 
 # Define the transformation for image processing
 transform = transforms.Compose([
@@ -97,10 +100,13 @@ class OrientationDetection:
                       for angle, score in zip(self.angles, probabilities)}
             return angles
 
-    def get_angles_avg(self, image: Image.Image) -> dict:
+    def get_angles_avg(self, image: Image.Image) -> tuple:
         """
         Process an image with all four rotations and average the predictions,
         accounting for the rotations.
+
+        Returns:
+            tuple: (angles_dict, inconsistencies)
         """
         # Convert image to tensor first
         tensor_image = self.to_tensor(image)
@@ -109,6 +115,9 @@ class OrientationDetection:
 
         # Create a dictionary to accumulate scores for each absolute orientation
         accumulated = {a: [] for a in self.angles}
+
+        # Track inconsistencies
+        inconsistencies = []
 
         # Base prediction (for the first orientation)
         base_pred = None
@@ -140,9 +149,12 @@ class OrientationDetection:
                     if not self.suppress_warnings:
                         # 30% difference threshold and > 10% confidence?
                         if score_diff > 0.3 and best_score > 0.1 and expected_score > 0.1:
-                            print(
-                                f"Note: Rotation consistency check - Expected {expected_angle}° but got {best_angle}° " +
-                                f"(scores: {best_score:.2f} vs {expected_score:.2f})")
+                            inconsistency_msg = (
+                                    f"Rotation consistency check - Expected {expected_angle}° but got {best_angle}° " +
+                                    f"(scores: {best_score:.2f} vs {expected_score:.2f})"
+                            )
+                            inconsistencies.append(inconsistency_msg)
+                            print(f"Note: {inconsistency_msg}")
 
             # Adjust angles to absolute orientation (relative to original image)
             for pred_angle, score in angles.items():
@@ -161,16 +173,16 @@ class OrientationDetection:
             overall_avg = sum(accumulated[angle]) / len(accumulated[angle])
             result[angle] = overall_avg
 
-        return result
+        return result, inconsistencies
 
     def get_best_angle(self, image: Image.Image) -> tuple:
         """
         Get the best angle and its confidence using the averaged method.
-        Returns (best_angle, confidence, all_probabilities)
+        Returns (best_angle, confidence, all_probabilities, inconsistencies)
         """
-        angles = self.get_angles_avg(image)
+        angles, inconsistencies = self.get_angles_avg(image)
         best_angle = max(angles, key=angles.get)
-        return best_angle, angles[best_angle], angles
+        return best_angle, angles[best_angle], angles, inconsistencies
 
 
 def recursive_iterdir(path: Path):
@@ -181,6 +193,61 @@ def recursive_iterdir(path: Path):
             yield from recursive_iterdir(i)
         else:
             yield i
+
+
+def preserve_file_metadata(source_path, target_path):
+    """
+    Preserve the file's metadata (creation time, modification time, etc.)
+
+    Args:
+        source_path: Path to the original file
+        target_path: Path to the new file
+    """
+    # Get original file stats
+    src_stat = os.stat(source_path)
+
+    # Preserve access and modification times
+    os.utime(target_path, (src_stat.st_atime, src_stat.st_mtime))
+
+
+def load_processed_files(csv_path):
+    """
+    Load a list of already processed files from the CSV.
+
+    Args:
+        csv_path: Path to the CSV file
+
+    Returns:
+        dict: Dictionary of already processed files with their paths as keys
+    """
+    processed_files = {}
+
+    if not csv_path or not Path(csv_path).exists():
+        return processed_files
+
+    try:
+        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            # Skip header
+            next(reader, None)
+
+            for row in reader:
+                if not row:
+                    continue
+
+                # First column should be the image path
+                img_path = row[0]
+
+                # Store other information if needed
+                processed_files[img_path] = {
+                    'best_angle': row[1] if len(row) > 1 else None,
+                    'corrected': row[7] if len(row) > 7 else None
+                }
+
+    except Exception as e:
+        print(f"Warning: Error reading CSV file: {e}")
+
+    return processed_files
 
 
 def main():
@@ -204,6 +271,8 @@ def main():
                         help='Suppress all consistency warnings')
     parser.add_argument('--verbose', action='store_true',
                         help='Print detailed probabilities for each image')
+    parser.add_argument('--skip_processed', action='store_true',
+                        help='Skip files that have already been processed (requires --csv)')
     args = parser.parse_args()
 
     print(f"PyTorch version: {torch.__version__}")
@@ -244,6 +313,12 @@ def main():
         print("4. Try running with --device cpu to use CPU as fallback.")
         sys.exit(1)
 
+    # Load already processed files if skip_processed is enabled and CSV exists
+    processed_files = {}
+    if args.skip_processed and args.csv:
+        processed_files = load_processed_files(args.csv)
+        print(f"Found {len(processed_files)} already processed files in {args.csv}")
+
     # Supported image extensions
     # Getting PIL's supported extensions
     Image.init()
@@ -263,29 +338,74 @@ def main():
     # Setup CSV output if requested
     csv_writer = None
     csv_file = None
+
+    # Check if CSV file exists and create or append based on that
     if args.csv:
+        csv_exists = Path(args.csv).exists()
         try:
-            csv_file = open(args.csv, 'w', newline='', encoding='utf-8')
+            # Open in append mode if file exists and skip_processed is enabled
+            mode = 'a' if csv_exists and args.skip_processed else 'w'
+            csv_file = open(args.csv, mode, newline='', encoding='utf-8')
             csv_writer = csv.writer(csv_file)
-            # Write header
-            csv_writer.writerow([
-                'Image', 'Best Angle', 'Confidence',
-                'Prob 0°', 'Prob 90°', 'Prob 180°', 'Prob 270°',
-                'Corrected'
-            ])
+
+            # Write header only if this is a new file or not appending
+            if mode == 'w':
+                csv_writer.writerow([
+                    'Image', 'Best Angle', 'Confidence',
+                    'Prob 0°', 'Prob 90°', 'Prob 180°', 'Prob 270°',
+                    'Corrected', 'Status', 'Inconsistencies'
+                ])
         except Exception as e:
             print(f"Error creating CSV file: {e}")
             args.csv = None
 
     # Process each image
+    inconsistent_count = 0
     corrected_count = 0
+    skipped_count = 0
+    errors_count = 0
+
+    print("==== batch processing starting ====")
+
     for img_path in image_files:
+        str_img_path = str(img_path)
+
+        # Skip already processed files if option is enabled
+        if args.skip_processed and str_img_path in processed_files:
+            print(f"Skipping already processed file: {img_path}")
+            skipped_count += 1
+
+            # Record skipped file in CSV if we're writing to one
+            if csv_writer:
+                # Get data from the processed files dictionary
+                processed_data = processed_files[str_img_path]
+
+                csv_writer.writerow([
+                    str_img_path,
+                    processed_data['best_angle'] if processed_data.get('best_angle') else "Unknown",
+                    "",  # Confidence
+                    "", "", "", "",  # Probabilities
+                    processed_data['corrected'] if processed_data.get('corrected') else "Unknown",
+                    "Skipped",
+                    ""  # Inconsistencies
+                ])
+            continue
+
         try:
             # Read the image
             img = od.read_image(str(img_path))
 
-            # Get the best angle, confidence, and all probabilities
-            best_angle, confidence, all_probs = od.get_best_angle(img)
+            # Get the original image's EXIF data
+            try:
+                exif_data = img.getexif()
+            except Exception:
+                exif_data = None
+
+            # Get the best angle, confidence, all probabilities, and inconsistencies
+            best_angle, confidence, all_probs, inconsistencies = od.get_best_angle(img)
+
+            if inconsistencies:
+                inconsistent_count += 1
 
             # Print the result
             if args.verbose:
@@ -297,6 +417,7 @@ def main():
                 print(f"{img_path}: Orientation {best_angle:03d}° (Confidence: {confidence * 100:.2f}%)")
 
             corrected = False
+            inconsistencies_str = "; ".join(inconsistencies) if inconsistencies else ""
 
             # Correct the orientation if requested and confidence is high enough
             if args.correct and confidence > args.threshold and best_angle != 0:
@@ -310,6 +431,22 @@ def main():
                 # Rotate the image
                 corrected_img = img.transpose(rotation_methods[best_angle])
 
+                # Copy EXIF data to the rotated image
+                if exif_data:
+                    # Make sure to update the orientation tag to normal (1)
+                    # Find the orientation tag
+                    orientation_tag = None
+                    for tag, tag_value in ExifTags.TAGS.items():
+                        if tag_value == 'Orientation':
+                            orientation_tag = tag
+                            break
+
+                    if orientation_tag and orientation_tag in exif_data:
+                        exif_data[orientation_tag] = 1  # Normal orientation
+
+                    # Apply the EXIF data to the corrected image
+                    corrected_img.info["exif"] = exif_data.tobytes()
+
                 # Save the corrected image
                 if output_folder:
                     # Preserve the directory structure relative to input_folder
@@ -319,13 +456,20 @@ def main():
                 else:
                     out_path = img_path
 
-                corrected_img.save(out_path)
+                # Save the image with original EXIF data
+                corrected_img.save(out_path, exif=exif_data)
+
+                # Preserve file metadata (creation/modification times)
+                preserve_file_metadata(str(img_path), str(out_path))
+
                 corrected_count += 1
                 corrected = True
                 print(f"  - Corrected to 0° and saved to {out_path}")
 
             # Write to CSV if requested
             if csv_writer:
+                status = "Processed" if not corrected else "Corrected"
+
                 csv_writer.writerow([
                     str(img_path),
                     best_angle,
@@ -334,16 +478,33 @@ def main():
                     f"{all_probs[90] * 100:.2f}%",
                     f"{all_probs[180] * 100:.2f}%",
                     f"{all_probs[270] * 100:.2f}%",
-                    "Yes" if corrected else "No"
+                    "Yes" if corrected else "No",
+                    status,
+                    inconsistencies_str
                 ])
 
         except Exception as e:
             print(f"Error processing {img_path}: {e}")
+            errors_count += 1
             if csv_writer:
-                csv_writer.writerow([str(img_path), "ERROR", str(e), "", "", "", "", "No"])
+                csv_writer.writerow([
+                    str(img_path),
+                    "ERROR",
+                    str(e),
+                    "", "", "", "",
+                    "No",
+                    "Error",
+                    ""
+                ])
+
+    print("==== batch processing complete ====")
+    print(f"Skipped: {skipped_count} images")
+    print(f"Processed: {len(image_files) - skipped_count} images")
+    print(f"Had Errors: {errors_count} images")
+    print(f"Inconsistent: {inconsistent_count} images")
 
     if args.correct:
-        print(f"Corrected {corrected_count} out of {len(image_files)} images")
+        print(f"Corrected {corrected_count} images")
 
     # Close CSV file if opened
     if csv_file:
