@@ -25,7 +25,7 @@ time per epoch: ~ 3h:45m
 
 ## Batch Folder Processing
 
-1. The `batch.py` tool loads the pre-trained ResNet152 model
+1. The `batch_orientation_detector.py` tool loads the pre-trained ResNet152 model
 2. For each image, it:
   - Creates preprocessed tensor versions
   - each of the four possible orientations
@@ -44,6 +44,10 @@ time per epoch: ~ 3h:45m
 - GPU acceleration - Uses CUDA if available for faster processing
 
 ### Usage
+
+1. Install Nvidia GameReady GPU Driver: https://www.nvidia.com/de-de/geforce/game-ready-drivers/
+2. Install Nvidia CUDA Toolkit: https://developer.nvidia.com/cuda-downloads
+3. Install Nvidia cuDNN Libraries: https://developer.nvidia.com/cudnn-downloads
 
 `python batch_orientation_detector.py input_folder [options]`
 

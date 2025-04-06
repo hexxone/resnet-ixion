@@ -3,3 +3,5 @@ numpy==1.24.1
 torch==2.1.2+cu118
 torchvision==0.16.2+cu118
 pillow>=10.0.0
+onnxruntime-gpu>=1.16.0; platform_system != "Darwin"
+onnxruntime>=1.16.0; platform_system == "Darwin"
